@@ -1,170 +1,193 @@
-import multiprocessing
 import threading
 import time
 import pyotp
-from typing import List, Dict
+from typing import List, Dict, Optional
+from dataclasses import dataclass
 from SmartApi import SmartConnect
 from SmartWebsocketv2 import SmartWebSocketV2
 from ..core.config import settings
 from ..core.logger import get_logger, log_exceptions
 import traceback
+from datetime import datetime
+import asyncio
 
 logger = get_logger(__name__)
 
+@dataclass
+class WebSocketConnection:
+    """Class to hold WebSocket connection details"""
+    id: str
+    websocket: SmartWebSocketV2
+    thread: threading.Thread
+    stop_event: threading.Event
+    token_lists: List[Dict]
+    created_at: datetime
+    is_active: bool = True
+
 class WebSocketManager:
     def __init__(self):
-        self.current_process = None
+        self.connections: Dict[str, WebSocketConnection] = {}
         self.token_lists: List[Dict] = []
-        self.stop_event = None
-        self.initialize_auth()
+        self.auth_data = self.initialize_auth()
 
     @log_exceptions(logger)
-    def initialize_auth(self):
+    def initialize_auth(self) -> Dict:
         """Initialize authentication with SmartAPI"""
         logger.info("Initializing SmartAPI authentication")
         try:
             obj = SmartConnect(api_key=settings.apikey, timeout=30)
             data = obj.generateSession(settings.username, settings.pwd, 
                                     pyotp.TOTP(settings.token).now())
-            self.auth_token = data['data']['jwtToken']
-            self.feed_token = obj.getfeedToken()
-            logger.info(f"Authentication successful. Feed token received")
+            return {
+                'auth_token': data['data']['jwtToken'],
+                'feed_token': obj.getfeedToken(),
+                'api_key': settings.apikey,
+                'username': settings.username
+            }
         except Exception as e:
             logger.error(f"Error during authentication: {str(e)}\nTraceback:\n{traceback.format_exc()}")
             raise
 
-    @log_exceptions(logger)
-    def websocket_process(self, token_lists, stop_event):
-        """Handle WebSocket connection and data streaming"""
-        logger.info(f"Starting WebSocket process with token lists: {token_lists}")
-        
-        sws = SmartWebSocketV2(self.auth_token, settings.apikey, 
-                             settings.username, self.feed_token)
-        correlation_id = "fastapi_feed"
-        mode = 1
-
-        def on_data(wsapp, message):
-            if not stop_event.is_set():  # Only process data if not stopping
-                logger.info(f"Received WebSocket data: {message}")
-
-        def on_open(wsapp):
-            if not stop_event.is_set():  # Only subscribe if not stopping
-                logger.info("WebSocket connection opened")
-                try:
-                    sws.subscribe(correlation_id, mode, token_lists)
-                    logger.info("Successfully subscribed to token feed")
-                except Exception as sub_error:
-                    logger.error(f"Subscription error: {str(sub_error)}\nTraceback:\n{traceback.format_exc()}")
-                    raise
-
-        def on_error(wsapp, error):
-            if not stop_event.is_set():  # Only attempt reconnect if not stopping
-                logger.error(f"WebSocket error: {str(error)}")
-                logger.info("Attempting to reconnect...")
-
-        def on_close(wsapp):
-            logger.info("WebSocket connection closed")
-
-        sws.on_data = on_data
-        sws.on_open = on_open
-        sws.on_error = on_error
-        sws.on_close = on_close
-
-        logger.info("Starting WebSocket connection thread")
-        ws_thread = threading.Thread(target=sws.connect)
-        ws_thread.start()
-
-        while not stop_event.is_set():
-            time.sleep(1)
-
-        # Unsubscribe before closing
+    def _run_websocket(self, connection_id: str, token_lists: List[Dict], stop_event: threading.Event):
+        """Run WebSocket connection in a thread"""
         try:
-            logger.info("Unsubscribing from token feed")
-            sws.unsubscribe(correlation_id, mode, token_lists)
-        except Exception as e:
-            logger.error(f"Error unsubscribing: {str(e)}")
+            sws = SmartWebSocketV2(
+                self.auth_data['auth_token'],
+                self.auth_data['api_key'],
+                self.auth_data['username'],
+                self.auth_data['feed_token']
+            )
 
-        logger.info("Stop event received, closing connection")
-        sws.close_connection()
-        ws_thread.join(timeout=5)  # Add timeout to thread join
-        if ws_thread.is_alive():
-            logger.warning("WebSocket thread did not close cleanly")
-        logger.info("WebSocket process completed")
+            correlation_id = f"feed_{connection_id}"
+            mode = 1
+
+            def on_data(wsapp, message):
+                if not stop_event.is_set():
+                    logger.info(f"[{connection_id}] Received data: {message}")
+
+            def on_open(wsapp):
+                if not stop_event.is_set():
+                    logger.info(f"[{connection_id}] Connection opened")
+                    try:
+                        sws.subscribe(correlation_id, mode, token_lists)
+                        logger.info(f"[{connection_id}] Subscribed to token feed")
+                    except Exception as sub_error:
+                        logger.error(f"[{connection_id}] Subscription error: {str(sub_error)}")
+                        raise
+
+            def on_error(wsapp, error):
+                if not stop_event.is_set():
+                    logger.error(f"[{connection_id}] Error: {str(error)}")
+
+            def on_close(wsapp):
+                logger.info(f"[{connection_id}] Connection closed")
+                if connection_id in self.connections:
+                    self.connections[connection_id].is_active = False
+
+            sws.on_data = on_data
+            sws.on_open = on_open
+            sws.on_error = on_error
+            sws.on_close = on_close
+
+            # Store connection in registry
+            if connection_id in self.connections:
+                self.connections[connection_id].websocket = sws
+
+            sws.connect()
+
+            while not stop_event.is_set():
+                time.sleep(0.1)
+
+            # Cleanup
+            try:
+                logger.info(f"[{connection_id}] Unsubscribing from token feed")
+                sws.unsubscribe(correlation_id, mode, token_lists)
+            except Exception as e:
+                logger.error(f"[{connection_id}] Error unsubscribing: {str(e)}")
+
+            logger.info(f"[{connection_id}] Closing connection")
+            sws.close_connection()
+
+        except Exception as e:
+            logger.error(f"[{connection_id}] Thread error: {str(e)}")
+        finally:
+            if connection_id in self.connections:
+                self.connections[connection_id].is_active = False
 
     @log_exceptions(logger)
-    def start_new_websocket(self, token_lists):
+    def start_new_websocket(self, token_lists: List[Dict]) -> bool:
         """Start a new WebSocket connection with updated tokens"""
-        logger.info("Starting new WebSocket connection")
-        
-        # Stop existing process if running
-        if self.stop_event and self.current_process:
-            logger.info("Stopping existing WebSocket process")
-            self.stop_event.set()
-            
-            # Wait for process to stop gracefully
-            self.current_process.join(timeout=5)
-            
-            if self.current_process.is_alive():
-                logger.warning("Process did not terminate gracefully, forcing termination")
-                self.current_process.terminate()
-                self.current_process.join(timeout=2)
-                
-                if self.current_process.is_alive():
-                    logger.warning("Process still alive, killing it")
-                    self.current_process.kill()
-                    self.current_process.join(timeout=1)
-            
-            self.current_process = None
-            self.stop_event = None
+        connection_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logger.info(f"Starting new WebSocket connection: {connection_id}")
 
-        # Create new process
-        logger.info("Creating new WebSocket process")
-        self.stop_event = multiprocessing.Event()
-        self.current_process = multiprocessing.Process(
-            target=self.websocket_process,
-            args=(token_lists, self.stop_event)
+        # Create stop event and thread
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._run_websocket,
+            args=(connection_id, token_lists, stop_event)
         )
-        
-        logger.info("Starting new process")
-        self.current_process.start()
-        
-        # Wait for process to start
-        start_time = time.time()
-        while time.time() - start_time < 10:  # Wait up to 10 seconds
-            if self.current_process.is_alive():
-                logger.info("New WebSocket process started successfully")
-                return True
-            time.sleep(0.1)
-        
-        raise Exception("WebSocket process failed to start within timeout")
+        thread.daemon = True
+
+        # Create connection object
+        connection = WebSocketConnection(
+            id=connection_id,
+            websocket=None,  # Will be set in _run_websocket
+            thread=thread,
+            stop_event=stop_event,
+            token_lists=token_lists,
+            created_at=datetime.now()
+        )
+
+        # Store in registry
+        self.connections[connection_id] = connection
+
+        # Start thread
+        thread.start()
+        return True
 
     @log_exceptions(logger)
     def update_tokens(self, new_tokens: List[Dict]) -> bool:
         """Update tokens and restart WebSocket if needed"""
         if new_tokens != self.token_lists:
             logger.info(f"Updating tokens: {new_tokens}")
-            # First update token list
             self.token_lists = new_tokens
-            # Then start new connection
             return self.start_new_websocket(new_tokens)
         logger.info("Tokens unchanged, no update needed")
         return False
 
+    def _cleanup_connection(self, connection_id: str):
+        """Clean up a specific connection"""
+        if connection_id in self.connections:
+            conn = self.connections[connection_id]
+            logger.info(f"Cleaning up connection {connection_id}")
+            conn.stop_event.set()
+            if conn.thread.is_alive():
+                conn.thread.join(timeout=5)
+            del self.connections[connection_id]
+
     @log_exceptions(logger)
     def cleanup(self):
-        """Clean up WebSocket connections"""
+        """Clean up all WebSocket connections"""
         logger.info("Starting WebSocket cleanup")
-        if self.stop_event:
-            self.stop_event.set()
-            if self.current_process:
-                self.current_process.join(timeout=5)
-                if self.current_process.is_alive():
-                    logger.warning("Process did not terminate gracefully, forcing termination")
-                    self.current_process.terminate()
-                    self.current_process.join(timeout=2)
-                    if self.current_process.is_alive():
-                        logger.warning("Process still alive, killing it")
-                        self.current_process.kill()
+        
+        # Make a copy of keys as we'll be modifying the dict
+        connection_ids = list(self.connections.keys())
+        
+        for connection_id in connection_ids:
+            self._cleanup_connection(connection_id)
+
         logger.info("WebSocket cleanup completed")
+
+    def get_active_connections(self) -> List[Dict]:
+        """Get list of active connections"""
+        return [
+            {
+                'id': conn.id,
+                'created_at': conn.created_at.isoformat(),
+                'is_active': conn.is_active,
+                'token_count': len(conn.token_lists)
+            }
+            for conn in self.connections.values()
+        ]
 
 websocket_manager = WebSocketManager()
