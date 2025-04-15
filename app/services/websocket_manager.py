@@ -7,6 +7,8 @@ from SmartApi import SmartConnect
 from SmartWebsocketv2 import SmartWebSocketV2
 from ..core.config import settings
 from ..core.logger import get_logger, log_exceptions
+from ..core.redis_client import redis_manager
+import json
 import traceback
 from datetime import datetime
 import asyncio
@@ -59,11 +61,22 @@ class WebSocketManager:
             )
 
             correlation_id = f"feed_{connection_id}"
-            mode = 1
+            mode = 2
 
             def on_data(wsapp, message):
                 if not stop_event.is_set():
                     logger.info(f"[{connection_id}] Received data: {message}")
+                    # Publish to Redis asynchronously using a background thread
+                    try:
+                        if isinstance(message, str):
+                            message = json.loads(message)
+                        threading.Thread(
+                            target=redis_manager.publish_market_data,
+                            args=(message,),
+                            daemon=True
+                        ).start()
+                    except Exception as e:
+                        logger.error(f"[{connection_id}] Failed to publish data: {str(e)}")
 
             def on_open(wsapp):
                 if not stop_event.is_set():
@@ -153,7 +166,8 @@ class WebSocketManager:
             self.token_lists = new_tokens
             return self.start_new_websocket(new_tokens)
         logger.info("Tokens unchanged, no update needed")
-        return False
+        return self.start_new_websocket(new_tokens)
+        # return False
 
     def _cleanup_connection(self, connection_id: str):
         """Clean up a specific connection"""

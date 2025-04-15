@@ -29,4 +29,21 @@ class RedisManager:
         logger.info("No tokens found in Redis")
         return None
 
+    @log_exceptions(logger)
+    def publish_market_data(self, data: Dict) -> None:
+        """Publish market data to Redis channel
+        
+        Args:
+            data: Dictionary containing market data
+        """
+        try:
+            # Use exchange type for channel to reduce number of channels
+            exchange_type = data.get('exchange_type', 'unknown')
+            channel = f"market_data:exchange:{exchange_type}"
+            message = json.dumps(data)
+            self.redis_client.publish(channel, message)
+        except Exception as e:
+            logger.error(f"Failed to publish market data: {str(e)}")
+            raise
+
 redis_manager = RedisManager()
